@@ -42,7 +42,7 @@ func main() {
 	listener, err := quic.Listen(conn, tlsConf, &quic.Config{})
 	if err != nil {
 		log.Fatalf("QUIC listen error: %v", err)
-	}
+	} // 建立好了对应端口的监听器listener
 
 	log.Printf("Server running on %s", *bindAddr)
 
@@ -65,7 +65,6 @@ func handleConnection(conn *quic.Conn) {
 	}
 
 	buf := make([]byte, 4096)
-
 	n, err := stream.Read(buf)
 	if err != nil {
 		log.Println("Read error:", err)
@@ -82,10 +81,19 @@ func handleConnection(conn *quic.Conn) {
 		}
 
 		packetBuf := make([]byte, numPackets*(MAX_DATAGRAM_SIZE-50))
-		_, err = stream.Write(packetBuf)
+
+		start := time.Now()
+		written, err := stream.Write(packetBuf) // 写回数据
 		if err != nil {
 			log.Println("Write error:", err)
+			return
 		}
+		elapsed := time.Since(start).Seconds()
+
+		mb := float64(written) / 1_000_000.0
+		mbps := mb * 8.0 / elapsed
+
+		log.Printf("Send %.2f MB in %.3f s, goodput %.2f Mbps\n", mb, elapsed, mbps)
 		return
 	}
 }
