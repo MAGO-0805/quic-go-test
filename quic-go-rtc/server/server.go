@@ -7,9 +7,9 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"flag"
 	"log"
 	"math/big"
-	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -22,9 +22,10 @@ const (
 )
 
 func main() {
-	addr := "127.0.0.1:8080"
-	udpAddr, _ := net.ResolveUDPAddr("udp", addr)
-	conn, _ := net.ListenUDP("udp", udpAddr)
+	// 命令行参数
+	addr := flag.String("p", "127.0.0.1:8080", "server port")
+	frameSize := flag.Int("f", 5000, "size of each frame in bytes")
+	flag.Parse()
 
 	tlsConf := generateTLSConfig()
 	quicConfig := &quic.Config{
@@ -32,12 +33,12 @@ func main() {
 		MaxIncomingUniStreams: 3000,
 	}
 
-	listener, err := quic.Listen(conn, tlsConf, quicConfig)
+	listener, err := quic.ListenAddr(*addr, tlsConf, quicConfig)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	log.Printf("Server running on %s", addr)
+	log.Printf("Server running on %s, frame size: %d bytes", *addr, *frameSize)
 
 	for {
 		session, err := listener.Accept(context.Background())
@@ -45,11 +46,11 @@ func main() {
 			log.Println("Accept session error:", err)
 			continue
 		}
-		go handleSession(session)
+		go handleSession(session, *frameSize)
 	}
 }
 
-func handleSession(session *quic.Conn) {
+func handleSession(session *quic.Conn, frameSize int) {
 	defer session.CloseWithError(0, "")
 	buf := make([]byte, 4096)
 
@@ -67,15 +68,14 @@ func handleSession(session *quic.Conn) {
 	}
 
 	numFrames, _ := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(req, "GETN")))
-	log.Printf("GetN request: %d frames", numFrames)
+	log.Printf("RTC Server GetN request: %d frames, each is %d B", numFrames, frameSize)
 
 	for i := 0; i < numFrames; i++ {
-		frame := make([]byte, 5000) // 每帧 5000B
+		frame := make([]byte, frameSize) // 每帧大小可通过参数控制
 		go func(f []byte) {
 			fs, err := session.OpenStreamSync(context.Background())
 			if err != nil {
 				if qerr, ok := err.(*quic.ApplicationError); ok && qerr.ErrorCode == 0 {
-					// 正常关闭的 stream，忽略
 					return
 				} else {
 					log.Println("OpenStreamSync error:", err)
