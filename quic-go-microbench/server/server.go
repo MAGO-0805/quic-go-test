@@ -8,13 +8,9 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"flag"
-	"io"
 	"log"
 	"math/big"
 	"net"
-	"net/http"
-	"net/url"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -22,131 +18,78 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-const NextProto = "hq-interop"
 const MAX_DATAGRAM_SIZE = 1350
 
-type responseWriter struct {
-	io.Writer
-	headers http.Header
-}
+func main() {
+	bindAddr := flag.String("p", "127.0.0.1:8080", "bind IP and port")
+	flag.Parse()
 
-var _ http.ResponseWriter = &responseWriter{}
-
-func (w *responseWriter) Header() http.Header {
-	if w.headers == nil {
-		w.headers = make(http.Header)
+	udpAddr, err := net.ResolveUDPAddr("udp", *bindAddr)
+	if err != nil {
+		log.Fatalf("Failed to resolve UDP address: %v", err)
 	}
-	return w.headers
-}
 
-func (w *responseWriter) WriteHeader(int) {}
+	conn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		log.Fatalf("Listen UDP error: %v", err)
+	}
 
-// Server is a HTTP/0.9 server listening for QUIC connections.
-type Server struct {
-	Handler *http.ServeMux
-}
+	tlsConf, err := generateTLSConfig()
+	if err != nil {
+		log.Fatalf("TLS config error: %v", err)
+	}
 
-// ServeListener serves HTTP/0.9 on all connections accepted from a QUIC listener.
-func (s *Server) ServeListener(ln *quic.EarlyListener) error {
+	listener, err := quic.Listen(conn, tlsConf, &quic.Config{})
+	if err != nil {
+		log.Fatalf("QUIC listen error: %v", err)
+	}
+
+	log.Printf("Server running on %s", *bindAddr)
+
 	for {
-		conn, err := ln.Accept(context.Background())
+		conn, err := listener.Accept(context.Background())
 		if err != nil {
-			return err
+			log.Fatal(err)
 		}
-		go s.handleConn(conn)
+		handleConnection(conn)
 	}
 }
 
-func (s *Server) handleConn(conn *quic.Conn) {
-	for {
-		str, err := conn.AcceptStream(context.Background())
-		if err != nil {
-			log.Printf("Error accepting stream: %s\n", err.Error())
+func handleConnection(conn *quic.Conn) {
+	defer conn.CloseWithError(0, "")
+
+	stream, err := conn.AcceptStream(context.Background())
+	if err != nil {
+		log.Println("Accept stream error:", err)
+		return
+	}
+
+	buf := make([]byte, 4096)
+
+	n, err := stream.Read(buf)
+	if err != nil {
+		log.Println("Read error:", err)
+		return
+	}
+
+	request := strings.TrimSpace(string(buf[:n]))
+	if strings.HasPrefix(request, "GETN") {
+		numStr := strings.TrimSpace(strings.TrimPrefix(request, "GETN"))
+		numPackets, err := strconv.Atoi(numStr)
+		if err != nil || numPackets <= 0 {
+			stream.CancelWrite(42)
 			return
 		}
-		go func() {
-			if err := s.handleStream(str); err != nil {
-				log.Printf("Handling stream failed: %s\n", err.Error())
-			}
-		}()
-	}
-}
 
-func (s *Server) handleStream(str *quic.Stream) error {
-	reqBytes, err := io.ReadAll(str) // change byte[] into string
-	if err != nil {
-		return err
-	}
-	request := string(reqBytes)
-	request = strings.TrimRight(request, "\r\n")
-	request = strings.TrimRight(request, " ")
-
-	log.Printf("Received request: %s\n", request)
-
-	// the only code I add!
-	if request[:5] == "GETN " {
-		sizeStr := strings.TrimPrefix(request, "GETN")
-		request_packet, err := strconv.Atoi(sizeStr) // abtain package number
-		if err != nil || request_packet < 0 {
-			str.CancelWrite(42)
-			return nil
-		}
-		buf := make([]byte, request_packet*(MAX_DATAGRAM_SIZE-50))
-		_, err = str.Write(buf) //send to client
+		packetBuf := make([]byte, numPackets*(MAX_DATAGRAM_SIZE-50))
+		_, err = stream.Write(packetBuf)
 		if err != nil {
-			return err
+			log.Println("Write error:", err)
 		}
-
-		return str.Close()
+		return
 	}
-
-	if request[:5] != "GET /" {
-		str.CancelWrite(42)
-		return nil
-	}
-
-	u, err := url.Parse(request[4:])
-	if err != nil {
-		return err
-	}
-	u.Scheme = "https"
-
-	req := &http.Request{
-		Method:     http.MethodGet,
-		Proto:      "HTTP/0.9",
-		ProtoMajor: 0,
-		ProtoMinor: 9,
-		Body:       str,
-		URL:        u,
-	}
-
-	handler := s.Handler
-	if handler == nil {
-		handler = http.DefaultServeMux
-	}
-
-	var panicked bool
-	func() {
-		defer func() {
-			if p := recover(); p != nil {
-				// Copied from net/http/server.go
-				const size = 64 << 10
-				buf := make([]byte, size)
-				buf = buf[:runtime.Stack(buf, false)]
-				log.Printf("http: panic serving: %v\n%s", p, buf)
-				panicked = true
-			}
-		}()
-		handler.ServeHTTP(&responseWriter{Writer: str}, req)
-	}()
-
-	if panicked {
-		if _, err := str.Write([]byte("500")); err != nil {
-			return err
-		}
-	}
-	return str.Close()
 }
+
 func generateTLSConfig() (*tls.Config, error) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -156,7 +99,7 @@ func generateTLSConfig() (*tls.Config, error) {
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(time.Hour * 24),
+		NotAfter:     time.Now().Add(24 * time.Hour),
 		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		Subject:      pkix.Name{CommonName: "localhost"},
@@ -174,46 +117,6 @@ func generateTLSConfig() (*tls.Config, error) {
 
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"http/0.9"}, // 或者你的协议
+		NextProtos:   []string{"http/0.9"},
 	}, nil
-}
-
-// add func main
-
-func main() {
-	var (
-		bind_addr = flag.String("p", "127.0.0.1:8080", "bind_IP") // 字符串类型
-		//start_time = flag.Float64("s", 0.0, "start time")        // 整数类型
-	)
-
-	//  解析命令行参数（必须在定义参数后调用）
-	flag.Parse()
-	addr, err := net.ResolveUDPAddr("udp", *bind_addr)
-	if err != nil {
-		log.Fatalf("Failed to resolve UDP address: %v", err)
-	}
-
-	// UDP 监听
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		log.Fatalf("listen UDP error: %v", err)
-	}
-
-	tr := &quic.Transport{Conn: conn}
-
-	tlsConf, err := generateTLSConfig()
-	if err != nil {
-		log.Fatalf("TLS config error: %v", err)
-	}
-
-	ln, err := tr.ListenEarly(tlsConf, &quic.Config{})
-	if err != nil {
-		log.Fatalf("listen QUIC error: %v", err)
-	}
-
-	server := &Server{}
-	log.Printf("Server running at %s", addr)
-	if err := server.ServeListener(ln); err != nil {
-		log.Fatalf("server stopped with error: %v", err)
-	}
 }
