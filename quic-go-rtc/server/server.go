@@ -7,7 +7,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"flag"
 	"log"
 	"math/big"
 	"net"
@@ -23,43 +22,36 @@ const (
 )
 
 func main() {
-	bindAddr := flag.String("p", "127.0.0.1:8080", "bind IP and port")
-	frameSize := flag.Int("f", 5000, "frame size in bytes")
-	flag.Parse()
+	addr := "127.0.0.1:8080"
+	udpAddr, _ := net.ResolveUDPAddr("udp", addr)
+	conn, _ := net.ListenUDP("udp", udpAddr)
 
-	udpAddr, err := net.ResolveUDPAddr("udp", *bindAddr)
-	if err != nil {
-		log.Fatalf("Failed to resolve UDP address: %v", err)
+	tlsConf := generateTLSConfig()
+	quicConfig := &quic.Config{
+		MaxIncomingStreams:    3000,
+		MaxIncomingUniStreams: 3000,
 	}
 
-	conn, err := net.ListenUDP("udp", udpAddr)
+	listener, err := quic.Listen(conn, tlsConf, quicConfig)
 	if err != nil {
-		log.Fatalf("Listen UDP error: %v", err)
+		log.Fatal(err)
 	}
 
-	tlsConf, err := generateTLSConfig()
-	if err != nil {
-		log.Fatalf("TLS config error: %v", err)
-	}
-
-	listener, err := quic.Listen(conn, tlsConf, &quic.Config{})
-	if err != nil {
-		log.Fatalf("QUIC listen error: %v", err)
-	}
-
-	log.Printf("Server running on %s", *bindAddr)
+	log.Printf("Server running on %s", addr)
 
 	for {
 		session, err := listener.Accept(context.Background())
 		if err != nil {
-			log.Fatal(err)
+			log.Println("Accept session error:", err)
+			continue
 		}
-		go handleSession(session, *frameSize)
+		go handleSession(session)
 	}
 }
 
-func handleSession(session *quic.Conn, frameSize int) {
+func handleSession(session *quic.Conn) {
 	defer session.CloseWithError(0, "")
+	buf := make([]byte, 4096)
 
 	stream, err := session.AcceptStream(context.Background())
 	if err != nil {
@@ -67,86 +59,56 @@ func handleSession(session *quic.Conn, frameSize int) {
 		return
 	}
 
-	buf := make([]byte, 4096)
-	n, err := stream.Read(buf)
-	if err != nil {
-		log.Println("Read error:", err)
+	n, _ := stream.Read(buf)
+	req := strings.TrimSpace(string(buf[:n]))
+	if !strings.HasPrefix(req, "GETN") {
+		log.Println("Unknown request:", req)
 		return
 	}
 
-	request := strings.TrimSpace(string(buf[:n]))
-	if !strings.HasPrefix(request, "GETN") {
-		log.Println("Unknown request:", request)
-		return
-	}
+	numFrames, _ := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(req, "GETN")))
+	log.Printf("GetN request: %d frames", numFrames)
 
-	numStr := strings.TrimSpace(strings.TrimPrefix(request, "GETN"))
-	numFrames, err := strconv.Atoi(numStr)
-	if err != nil || numFrames <= 0 {
-		log.Println("Invalid frame number:", numStr)
-		return
-	}
-	log.Printf("RTC Server GetN request: %d frames", numFrames)
-	log.Printf("Sending %d frames of %d bytes each", numFrames, frameSize)
-
-	totalBytes := 0
-	startTime := time.Now()
-
-	// 按帧发送，每帧开一个 stream
 	for i := 0; i < numFrames; i++ {
-		frame := make([]byte, frameSize)
-		frameStream, err := session.OpenStreamSync(context.Background())
-		if err != nil {
-			log.Println("Open stream error:", err)
-			return
-		}
-
-		written, err := frameStream.Write(frame)
-		if err != nil {
-			log.Println("Write error:", err)
-			return
-		}
-
-		totalBytes += written
-
-		// 33ms 间隔
+		frame := make([]byte, 5000) // 每帧 5000B
+		go func(f []byte) {
+			fs, err := session.OpenStreamSync(context.Background())
+			if err != nil {
+				if qerr, ok := err.(*quic.ApplicationError); ok && qerr.ErrorCode == 0 {
+					// 正常关闭的 stream，忽略
+					return
+				} else {
+					log.Println("OpenStreamSync error:", err)
+					return
+				}
+			}
+			_, err = fs.Write(f)
+			if err != nil {
+				log.Println("Stream write error:", err)
+			}
+			fs.Close()
+		}(frame)
 		time.Sleep(FRAME_INTERVAL)
 	}
-
-	elapsed := time.Since(startTime).Seconds()
-	mb := float64(totalBytes) / 1_000_000.0
-	mbps := mb * 8.0 / elapsed
-
-	log.Printf("Sent %.2f MB in %.3f seconds, goodput: %.2f Mbps", mb, elapsed, mbps)
 }
 
-func generateTLSConfig() (*tls.Config, error) {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return nil, err
-	}
-
-	tmpl := &x509.Certificate{
+func generateTLSConfig() *tls.Config {
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	template := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(24 * time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
 		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		Subject:      pkix.Name{CommonName: "localhost"},
 	}
-
-	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		return nil, err
-	}
-
+	certDER, _ := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	cert := tls.Certificate{
 		Certificate: [][]byte{certDER},
 		PrivateKey:  key,
 	}
-
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		NextProtos:   []string{"http/0.9"},
-	}, nil
+	}
 }
