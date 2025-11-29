@@ -30,7 +30,7 @@ func main() {
 	}
 	defer session.CloseWithError(0, "")
 
-	log.Printf("GetN request: 300 frames( %d secondes)", int(*requestFrames/30))
+	log.Printf("GetN request: %d frames ( %d seconds)", *requestFrames, int(*requestFrames/30))
 	// 发送 GETN 请求
 	stream, err := session.OpenStreamSync(context.Background())
 	if err != nil {
@@ -47,19 +47,19 @@ func main() {
 
 	start := time.Now()
 
-	// 接收每个 stream
+	// 接收每个 server-initiated uni stream
 	wg.Add(*requestFrames)
 	for i := 0; i < *requestFrames; i++ {
 		go func() {
 			defer wg.Done()
 
-			s, err := session.AcceptStream(context.Background())
+			s, err := session.AcceptUniStream(context.Background())
 			if err != nil {
 				if qerr, ok := err.(*quic.ApplicationError); ok && qerr.ErrorCode == 0 {
 					// 正常关闭的 stream，忽略
 					return
 				} else {
-					log.Println("AcceptStream error:", err)
+					log.Println("AcceptUniStream error:", err)
 					return
 				}
 			}

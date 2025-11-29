@@ -8,10 +8,14 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -52,6 +56,7 @@ func main() {
 
 func handleSession(session *quic.Conn, frameSize int) {
 	defer session.CloseWithError(0, "")
+
 	buf := make([]byte, 4096)
 
 	stream, err := session.AcceptStream(context.Background())
@@ -60,36 +65,91 @@ func handleSession(session *quic.Conn, frameSize int) {
 		return
 	}
 
-	n, _ := stream.Read(buf)
+	n, err := stream.Read(buf)
+	if err != nil && err != io.EOF {
+		log.Println("Read request error:", err)
+		return
+	}
+
 	req := strings.TrimSpace(string(buf[:n]))
 	if !strings.HasPrefix(req, "GETN") {
 		log.Println("Unknown request:", req)
 		return
 	}
 
-	numFrames, _ := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(req, "GETN")))
+	numFrames, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(req, "GETN")))
+	if err != nil {
+		log.Println("Invalid GETN request number:", err)
+		return
+	}
+
 	log.Printf("RTC Server GetN request: %d frames, each is %d B", numFrames, frameSize)
+
+	var wg sync.WaitGroup
+	var totalBytes int64
+	startTime := time.Now()
 
 	for i := 0; i < numFrames; i++ {
 		frame := make([]byte, frameSize) // 每帧大小可通过参数控制
+		wg.Add(1)
 		go func(f []byte) {
-			fs, err := session.OpenStreamSync(context.Background())
+			defer wg.Done()
+
+			fs, err := session.OpenUniStreamSync(context.Background())
 			if err != nil {
 				if qerr, ok := err.(*quic.ApplicationError); ok && qerr.ErrorCode == 0 {
 					return
-				} else {
-					log.Println("OpenStreamSync error:", err)
-					return
+				}
+				log.Println("OpenStreamSync error:", err)
+				return
+			}
+
+			// write loop to handle partial writes
+			remaining := f
+			for len(remaining) > 0 {
+				n, err := fs.Write(remaining)
+				if n > 0 {
+					atomic.AddInt64(&totalBytes, int64(n))
+					remaining = remaining[n:]
+				}
+				if err != nil {
+					// if stream write returns EOF or other error, log and stop trying for this stream
+					if err == io.EOF {
+						break
+					}
+					log.Println("Stream write error:", err)
+					break
 				}
 			}
-			_, err = fs.Write(f)
-			if err != nil {
-				log.Println("Stream write error:", err)
-			}
+
 			fs.Close()
 		}(frame)
+
 		time.Sleep(FRAME_INTERVAL)
 	}
+
+	// wait for all frame goroutines to finish
+	wg.Wait()
+
+	elapsed := time.Since(startTime).Seconds()
+	total := atomic.LoadInt64(&totalBytes)
+	goodput := 0.0
+	if elapsed > 0 {
+		goodput = float64(total) * 8.0 / 1e6 / elapsed // Mbps
+	}
+	log.Printf("Sent %s in %.3f seconds, goodput: %.2f Mbps", printBytes(int(total)), elapsed, goodput)
+}
+
+// printBytes formats bytes into human-readable string similar to Rust impl
+func printBytes(b int) string {
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	size := float64(b)
+	unit := 0
+	for size >= 1000.0 && unit < len(units)-1 {
+		size /= 1000.0
+		unit++
+	}
+	return fmt.Sprintf("%.2f %s", size, units[unit])
 }
 
 func generateTLSConfig() *tls.Config {
