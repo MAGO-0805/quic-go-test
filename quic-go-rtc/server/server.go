@@ -29,7 +29,18 @@ func main() {
 	// 命令行参数
 	addr := flag.String("p", "127.0.0.1:8080", "server port")
 	frameSize := flag.Int("f", 5000, "size of each frame in bytes")
+	t := flag.Float64("t", 0.0, "Start time of the test (unix seconds, 0 means now)")
 	flag.Parse()
+
+	// compute start time baseline: if t==0 use now, else use provided unix seconds (with fraction)
+	var startTimeBase time.Time
+	if *t == 0.0 {
+		startTimeBase = time.Now()
+	} else {
+		sec := int64(*t)
+		nsec := int64((*t - float64(sec)) * 1e9)
+		startTimeBase = time.Unix(sec, nsec)
+	}
 
 	tlsConf := generateTLSConfig()
 	quicConfig := &quic.Config{
@@ -50,11 +61,11 @@ func main() {
 			log.Println("Accept session error:", err)
 			continue
 		}
-		go handleSession(session, *frameSize)
+		go handleSession(session, *frameSize, startTimeBase)
 	}
 }
 
-func handleSession(session *quic.Conn, frameSize int) {
+func handleSession(session *quic.Conn, frameSize int, startTime time.Time) {
 	defer session.CloseWithError(0, "")
 
 	buf := make([]byte, 4096)
@@ -87,12 +98,15 @@ func handleSession(session *quic.Conn, frameSize int) {
 
 	var wg sync.WaitGroup
 	var totalBytes int64
-	startTime := time.Now()
+	// use startTime passed from main (baseline for per-frame logs)
+	// record actual request start time for elapsed/goodput
+	requestStart := time.Now()
 
 	for i := 0; i < numFrames; i++ {
 		frame := make([]byte, frameSize) // 每帧大小可通过参数控制
 		wg.Add(1)
-		go func(f []byte) {
+		idx := i + 1
+		go func(idx int, f []byte) {
 			defer wg.Done()
 
 			fs, err := session.OpenUniStreamSync(context.Background())
@@ -123,7 +137,9 @@ func handleSession(session *quic.Conn, frameSize int) {
 			}
 
 			fs.Close()
-		}(frame)
+			// print the time when the frame is sent to the stream (seconds since request start)
+			fmt.Printf("frame %d, sent time: %.6f\n", idx, time.Since(startTime).Seconds())
+		}(idx, frame)
 
 		time.Sleep(FRAME_INTERVAL)
 	}
@@ -131,7 +147,8 @@ func handleSession(session *quic.Conn, frameSize int) {
 	// wait for all frame goroutines to finish
 	wg.Wait()
 
-	elapsed := time.Since(startTime).Seconds()
+	// compute elapsed from the actual request start
+	elapsed := time.Since(requestStart).Seconds()
 	total := atomic.LoadInt64(&totalBytes)
 	goodput := 0.0
 	if elapsed > 0 {

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -17,7 +18,18 @@ func main() {
 	serverAddr := flag.String("p", "127.0.0.1:8080", "server IP:port")
 	requestFrames := flag.Int("f", 300, "number of frames to request")
 	frameSize := flag.Int("s", 5000, "frame size in bytes")
+	t := flag.Float64("t", 0.0, "Start time of the test (unix seconds, 0 means now)")
 	flag.Parse()
+
+	// compute baseline time for logs: if t==0 use now, else use provided unix seconds (with fraction)
+	var baseline time.Time
+	if *t == 0.0 {
+		baseline = time.Now()
+	} else {
+		sec := int64(*t)
+		nsec := int64((*t - float64(sec)) * 1e9)
+		baseline = time.Unix(sec, nsec)
+	}
 
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: true,
@@ -44,8 +56,10 @@ func main() {
 	totalBytes := 0
 	var totalBytesMutex sync.Mutex
 	var wg sync.WaitGroup
+	var frameCounter int64
 
-	start := time.Now()
+	// record the actual request start time (for elapsed/goodput)
+	requestStart := time.Now()
 
 	// 接收每个 server-initiated uni stream
 	wg.Add(*requestFrames)
@@ -79,13 +93,17 @@ func main() {
 					break
 				}
 			}
+			// When stream finished, increment frame counter and print fin time
+			id := int(atomic.AddInt64(&frameCounter, 1))
+			// print fin time relative to baseline (-t)
+			fmt.Printf("frame %d, fin time: %.6f\n", id, time.Since(baseline).Seconds())
 		}()
 	}
 
 	// 等待所有帧接收完成
 	wg.Wait()
 
-	elapsed := time.Since(start).Seconds()
+	elapsed := time.Since(requestStart).Seconds()
 	mb := float64(totalBytes) / 1_000_000.0
 	mbps := mb * 8.0 / elapsed
 
